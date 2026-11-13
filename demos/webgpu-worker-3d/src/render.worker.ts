@@ -1,210 +1,239 @@
 /// <reference lib="webworker" />
+import { Application, DOMAdapter, Text, WebWorkerAdapter } from 'pixi.js';
+// The webworker environment leaves out pixi's EventSystem (no DOM); bring it back for picking and OrbitCamera.
+import 'pixi.js/events';
 import {
-    Application,
-    Buffer,
-    BufferUsage,
-    DOMAdapter,
-    Geometry,
-    GlProgram,
-    GpuProgram,
-    Mesh,
-    Shader,
-    State,
-    Text,
-    UniformGroup,
-    WebWorkerAdapter,
-} from 'pixi.js';
-import { lookAt, multiply, perspective } from './math';
-import { glFragment, glVertex, wgsl } from './shaders';
+    AmbientLight,
+    BatchedMesh3D,
+    Box,
+    CubeGeometry,
+    DirectionalLight,
+    Material3D,
+    Matrix4,
+    Mesh3D,
+    PlaneGeometry,
+    RenderPassBit,
+    SphereGeometry,
+    View3D,
+} from '@pixi/3d';
+import { OrbitCamera } from '@pixi/3d/extras';
+import { describeCanvasLayout, dispatchForwarded, installWorkerEventShims } from './workerEvents';
 
+import type { ShaderBit } from '@pixi/3d';
 import type { FromWorker, ToWorker } from './protocol';
 
-// Must run before any Pixi object is created: swaps DOM APIs for OffscreenCanvas & friends.
+// Must run before any pixi object is created: swaps DOM APIs for OffscreenCanvas & friends.
 DOMAdapter.set(WebWorkerAdapter);
+installWorkerEventShims();
 
 const post = (msg: FromWorker) => postMessage(msg);
 
 let app: Application | null = null;
-let mesh: Mesh<Geometry, Shader> | null = null;
-let hud: Text | null = null;
+let canvas: OffscreenCanvas | null = null;
+let view: View3D | null = null;
+let field: BatchedMesh3D | null = null;
+let sun: DirectionalLight | null = null;
+let orb: Mesh3D | null = null;
 let grid = 0;
-// `init` is async, so resize/grid messages can arrive before the renderer exists: keep the latest.
 let ready = false;
+// `init` is async, so these can arrive before the renderer exists: keep the latest.
 let pendingResize: Extract<ToWorker, { type: 'resize' }> | null = null;
 let pendingGrid: number | null = null;
 
-// ---------- orbit camera, driven by pointer events forwarded from the main thread ----------
-const camera = { yaw: 0.6, pitch: 0.5, distance: 60, autoSpin: true };
-const pointers = new Map<number, { x: number; y: number }>();
+const SPACING = 1.6;
+const cube = new CubeGeometry({ width: 0.9, height: 0.9, depth: 0.9 });
 
-const proj = new Float32Array(16);
-const view = new Float32Array(16);
-const viewProj = new Float32Array(16);
+// Per-instance colour: a vec4 field on the batch, read by a shader bit as `instance.tint`.
+const tintBit: ShaderBit = {
+    name: 'instanceTint',
+    bindings: { instance: { tint: 'vec4<f32>' } },
+    gpu: { fragment: { material: 'albedo *= instance.tint.rgb;' } },
+    gl: { fragment: { material: 'albedo *= instance.tint.rgb;' } },
+};
+const cubeMaterial = new Material3D({ baseColor: 0xffffff, roughness: 0.45, metallic: 0.1, extraBits: [tintBit] });
 
-const sceneUniforms = new UniformGroup({
-    uViewProj: { value: viewProj, type: 'mat4x4<f32>' },
-    uLightDir: { value: new Float32Array([0.4, 0.9, 0.3, 0]), type: 'vec4<f32>' },
-    uTime: { value: 0, type: 'f32' },
-});
+// Grid offsets of every slot, read each frame to animate the matrices on the worker's CPU.
+let seeds = new Float32Array(0);
+const m = new Matrix4();
+const pos = { x: 0, y: 0, z: 0 };
 
-// ---------- geometry ----------
-function cubeVertices(size: number)
-{
-    const positions: number[] = [];
-    const normals: number[] = [];
-    const s = size / 2;
-    const face = (n: number[], c: number[][]) =>
-    {
-        for (const i of [0, 1, 2, 0, 2, 3])
-        {
-            positions.push(...c[i]);
-            normals.push(...n);
-        }
-    };
-
-    face([1, 0, 0], [[s, -s, -s], [s, s, -s], [s, s, s], [s, -s, s]]);
-    face([-1, 0, 0], [[-s, -s, s], [-s, s, s], [-s, s, -s], [-s, -s, -s]]);
-    face([0, 1, 0], [[-s, s, -s], [-s, s, s], [s, s, s], [s, s, -s]]);
-    face([0, -1, 0], [[-s, -s, s], [-s, -s, -s], [s, -s, -s], [s, -s, s]]);
-    face([0, 0, 1], [[-s, -s, s], [s, -s, s], [s, s, s], [-s, s, s]]);
-    face([0, 0, -1], [[s, -s, -s], [-s, -s, -s], [-s, s, -s], [s, s, -s]]);
-
-    return { positions: new Float32Array(positions), normals: new Float32Array(normals) };
-}
-
-const cube = cubeVertices(1);
-
-function buildGeometry(n: number): Geometry
+function buildField(n: number): BatchedMesh3D
 {
     const count = n * n * n;
-    const offsets = new Float32Array(count * 3);
-    const colors = new Float32Array(count * 3);
-    const spacing = 2;
-    const half = ((n - 1) * spacing) / 2;
-    let i = 0;
+    const batch = new BatchedMesh3D({
+        size: count,
+        instanceData: { tint: { value: [1, 1, 1, 1], type: 'vec4<f32>' } },
+    });
+    const half = ((n - 1) * SPACING) / 2;
+    const step = 1 / Math.max(n - 1, 1);
 
-    for (let x = 0; x < n; x++)
+    seeds = new Float32Array(count * 3);
+
+    for (let i = 0, x = 0; x < n; x++)
     {
         for (let y = 0; y < n; y++)
         {
-            for (let z = 0; z < n; z++)
+            for (let z = 0; z < n; z++, i++)
             {
-                offsets[i] = (x * spacing) - half;
-                offsets[i + 1] = (y * spacing) - half;
-                offsets[i + 2] = (z * spacing) - half;
-                colors[i] = 0.3 + (0.7 * x / Math.max(n - 1, 1));
-                colors[i + 1] = 0.3 + (0.7 * y / Math.max(n - 1, 1));
-                colors[i + 2] = 0.3 + (0.7 * z / Math.max(n - 1, 1));
-                i += 3;
+                seeds[i * 3] = (x * SPACING) - half;
+                seeds[(i * 3) + 1] = (y * SPACING) + 1.5;
+                seeds[(i * 3) + 2] = (z * SPACING) - half;
+
+                batch.setGeometryAt(i, cube);
+                batch.setMaterialAt(i, cubeMaterial);
+                batch.setMatrixAt(i, m.makeRotationY(0).setPosition({
+                    x: seeds[i * 3], y: seeds[(i * 3) + 1], z: seeds[(i * 3) + 2],
+                }));
+                batch.setInstanceDataAt(i, 'tint', 0.25 + (0.75 * x * step), 0.25 + (0.75 * y * step),
+                    0.25 + (0.75 * z * step), 1);
+                batch.setPassesAt(i, RenderPassBit.OPAQUE | RenderPassBit.SHADOW);
             }
         }
     }
 
-    return new Geometry({
-        attributes: {
-            aPosition: { buffer: cube.positions, format: 'float32x3' },
-            aNormal: { buffer: cube.normals, format: 'float32x3' },
-            aOffset: {
-                buffer: new Buffer({ data: offsets, usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
-                format: 'float32x3',
-                instance: true,
-            },
-            aColor: {
-                buffer: new Buffer({ data: colors, usage: BufferUsage.VERTEX | BufferUsage.COPY_DST }),
-                format: 'float32x3',
-                instance: true,
-            },
-        },
-        instanceCount: count,
-    });
+    return batch;
 }
 
 function setGrid(n: number)
 {
-    if (!mesh) return;
     grid = n;
+    const old = field;
 
-    const old = mesh.geometry;
+    field = buildField(n);
+    view!.root.addChild(field);
+    old?.destroy();
 
-    mesh.geometry = buildGeometry(n);
-    old.destroy(true);
-    camera.distance = Math.max(20, n * 3.2);
+    // Park the clickable sphere just outside the grid.
+    const half = ((n - 1) * SPACING) / 2;
+
+    orb!.position.set(half + 5, 2, 0);
+
+    // Past 256 casters the sun measures its shadow box once; give it a fixed box that covers
+    // the grid at the top of its wave, plus the sphere.
+    const size = (n * SPACING) + 14;
+
+    sun!.shadow.bounds = Box.fromCenterSize({ x: 0, y: size / 2, z: 0 }, size);
 }
 
-// ---------- frame ----------
-function updateCamera()
+function animate(time: number)
 {
-    const r = app!.renderer;
-    const aspect = r.width / r.height;
+    if (!field) return;
 
-    camera.pitch = Math.max(-1.4, Math.min(1.4, camera.pitch));
-    const cp = Math.cos(camera.pitch);
-    const eye: [number, number, number] = [
-        camera.distance * cp * Math.sin(camera.yaw),
-        camera.distance * Math.sin(camera.pitch),
-        camera.distance * cp * Math.cos(camera.yaw),
-    ];
+    for (let i = 0; i < field.size; i++)
+    {
+        pos.x = seeds[i * 3];
+        pos.z = seeds[(i * 3) + 2];
+        const phase = (Math.hypot(pos.x, pos.z) * 0.25) - (time * 1.5);
 
-    perspective(proj, Math.PI / 4, aspect, 0.1, 1000);
-    lookAt(view, eye, [0, 0, 0], [0, 1, 0]);
-    multiply(viewProj, proj, view);
-    sceneUniforms.update();
+        pos.y = seeds[(i * 3) + 1] + (Math.sin(phase) * 0.8);
+        field.setMatrixAt(i, m.makeRotationY(phase).setPosition(pos));
+    }
 }
 
 async function init(msg: Extract<ToWorker, { type: 'init' }>)
 {
+    canvas = msg.canvas;
+    describeCanvasLayout(canvas, msg.width, msg.height);
+
     app = new Application();
     await app.init({
-        canvas: msg.canvas,
+        canvas,
         width: msg.width,
         height: msg.height,
         resolution: msg.resolution,
         preference: msg.preference,
-        depth: true,
         antialias: true,
         background: '#0b0d17',
-        // no DOM in a worker: Pixi's EventSystem has nothing to listen to
-        eventMode: 'none',
     });
 
-    const shader = new Shader({
-        gpuProgram: GpuProgram.from({
-            vertex: { source: wgsl, entryPoint: 'mainVert' },
-            fragment: { source: wgsl, entryPoint: 'mainFrag' },
-        }),
-        glProgram: GlProgram.from({ vertex: glVertex, fragment: glFragment }),
-        resources: { scene: sceneUniforms },
+    view = new View3D({
+        autoResize: true,
+        toneMapping: 'aces',
+        shadowQuality: 'medium',
+        environment: { skyColor: 0xb8c8ff, groundColor: 0x2a2236, intensity: 0.6 },
+    });
+    app.stage.addChild(view);
+
+    sun = new DirectionalLight({ color: 0xfff2dc, intensity: 3.5, castShadow: true });
+
+    sun.rotation.set(-Math.PI / 3, Math.PI / 5, 0);
+    view.root.addChild(sun, new AmbientLight({ color: 0x8090ff, intensity: 0.3 }));
+
+    const ground = new Mesh3D({
+        geometry: new PlaneGeometry({ width: 200, height: 200 }),
+        material: new Material3D({ baseColor: 0x1d2130, roughness: 1 }),
+        receiveShadow: true,
+        castShadow: false,
+        parent: view.root,
     });
 
-    const state = new State();
+    ground.rotation.set(-Math.PI / 2, 0, 0);
 
-    state.blendMode = 'none';
-    state.depthTest = true;
-    state.depthMask = true;
-    state.cullMode = 'back';
+    // A clickable sphere: forwarded pointer events reach pixi's picking inside the worker.
+    const orbColors = [0xff5a5f, 0xffc145, 0x5bc0eb, 0x9bc53d, 0xc06cff];
+    let orbColor = 0;
+    const orbMaterial = new Material3D({ baseColor: orbColors[0], roughness: 0.2, metallic: 0.3 });
 
-    mesh = new Mesh({ geometry: buildGeometry(msg.grid), shader, state });
-    grid = msg.grid;
-    camera.distance = Math.max(20, grid * 3.2);
-    app.stage.addChild(mesh);
+    orb = new Mesh3D({
+        geometry: new SphereGeometry({ radius: 2 }),
+        material: orbMaterial,
+        castShadow: true,
+        eventMode: 'static',
+        cursor: 'pointer',
+        parent: view.root,
+    });
 
-    // Ordinary Pixi 2D content, drawn after the 3D mesh in the same pass.
-    hud = new Text({
-        text: 'PixiJS',
+    orb.on('pointertap', (e) =>
+    {
+        if (e.button !== 0) return;
+        orbColor = (orbColor + 1) % orbColors.length;
+        orbMaterial.baseColor = orbColors[orbColor];
+    });
+
+    setGrid(msg.grid);
+
+    view.camera.far = 2000;
+    view.camera.position.set(0, grid * 1.4, grid * 3.2);
+    const orbit = new OrbitCamera({
+        view,
+        target: { x: 0, y: 2, z: 0 },
+        enableDamping: true,
+        autoRotate: true,
+        autoRotateSpeed: 0.5,
+        minDistance: 6,
+        maxDistance: 400,
+        autoUpdate: false,
+    });
+
+    // 2D HUD on top of the 3D view, drawn by the same renderer.
+    const hud = new Text({
+        text: 'PixiJS 3D',
         style: { fill: '#ffffff', fontFamily: 'monospace', fontSize: 14, lineHeight: 20 },
     });
+
     hud.position.set(12, 12);
     app.stage.addChild(hud);
 
     const rendererName = app.renderer.name;
+    let time = 0;
     let frames = 0;
     let last = performance.now();
+    let lastCursor = '';
 
     app.ticker.add((ticker) =>
     {
-        if (camera.autoSpin) camera.yaw += 0.003 * ticker.deltaTime;
-        sceneUniforms.uniforms.uTime += ticker.deltaMS / 1000;
-        updateCamera();
+        time += ticker.deltaMS / 1000;
+        animate(time);
+        orbit.update(ticker);
+
+        // An OffscreenCanvas has no style: hand the hover cursor to the main thread.
+        const cursor = app!.renderer.events.rootBoundary.cursor ?? 'default';
+
+        if (cursor !== lastCursor)
+        {
+            lastCursor = cursor;
+            post({ type: 'cursor', cursor });
+        }
 
         frames++;
         const now = performance.now();
@@ -214,8 +243,9 @@ async function init(msg: Extract<ToWorker, { type: 'init' }>)
             const fps = (frames * 1000) / (now - last);
             const cubes = grid ** 3;
 
-            hud!.text = `PixiJS ${rendererName} · rendered in a Web Worker\n`
-                + `${cubes.toLocaleString()} cubes · 1 instanced draw call · ${fps.toFixed(0)} fps`;
+            hud.text = `@pixi/3d on ${rendererName} · rendered in a Web Worker\n`
+                + `${cubes.toLocaleString()} cubes in one BatchedMesh3D · ${fps.toFixed(0)} fps\n`
+                + 'click the sphere';
             post({ type: 'stats', fps, cubes });
             frames = 0;
             last = now;
@@ -223,12 +253,18 @@ async function init(msg: Extract<ToWorker, { type: 'init' }>)
     });
 
     ready = true;
-    if (pendingResize) app.renderer.resize(pendingResize.width, pendingResize.height, pendingResize.resolution);
+    if (pendingResize) resize(pendingResize);
     if (pendingGrid !== null) setGrid(pendingGrid);
     pendingResize = null;
     pendingGrid = null;
 
     post({ type: 'ready', renderer: rendererName });
+}
+
+function resize({ width, height, resolution }: { width: number; height: number; resolution: number })
+{
+    describeCanvasLayout(canvas!, width, height);
+    app!.renderer.resize(width, height, resolution);
 }
 
 self.onmessage = async (e: MessageEvent<ToWorker>) =>
@@ -243,39 +279,15 @@ self.onmessage = async (e: MessageEvent<ToWorker>) =>
                 await init(msg);
                 break;
             case 'resize':
-                if (ready) app!.renderer.resize(msg.width, msg.height, msg.resolution);
+                if (ready) resize(msg);
                 else pendingResize = msg;
                 break;
             case 'grid':
                 if (ready) setGrid(msg.grid);
                 else pendingGrid = msg.grid;
                 break;
-            case 'pointer': {
-                if (msg.kind === 'down')
-                {
-                    pointers.set(msg.id, { x: msg.x, y: msg.y });
-                    camera.autoSpin = false;
-                }
-                else if (msg.kind === 'move')
-                {
-                    const p = pointers.get(msg.id);
-
-                    if (p)
-                    {
-                        camera.yaw -= (msg.x - p.x) * 0.005;
-                        camera.pitch += (msg.y - p.y) * 0.005;
-                        p.x = msg.x;
-                        p.y = msg.y;
-                    }
-                }
-                else
-                {
-                    pointers.delete(msg.id);
-                }
-                break;
-            }
-            case 'wheel':
-                camera.distance = Math.max(5, Math.min(400, camera.distance * Math.exp(msg.deltaY * 0.001)));
+            case 'event':
+                if (ready) dispatchForwarded(canvas!, msg.event);
                 break;
         }
     }

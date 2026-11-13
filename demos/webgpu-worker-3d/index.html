@@ -8,8 +8,8 @@
         :root { color-scheme: dark; --bg: #0b0d17; --panel: rgba(20, 24, 40, 0.85); --fg: #e6e8f0; --muted: #9aa0b4; --accent: #e91e63; --err: #ff6b6b; }
         * { box-sizing: border-box; }
         html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
-        #view { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: grab; }
-        #view:active { cursor: grabbing; }
+        #view { display: block; width: 100vw; height: 100vh; touch-action: none; }
+        
         .panel { position: fixed; right: 16px; bottom: 16px; width: min(320px, calc(100vw - 32px)); padding: 14px 16px; border-radius: 10px; background: var(--panel); backdrop-filter: blur(6px); display: grid; gap: 10px; }
         .row { display: flex; justify-content: space-between; gap: 12px; }
         .muted { color: var(--muted); }
@@ -27,10 +27,10 @@
         <div class="row"><span class="muted">Main thread</span><span id="main-fps">–</span></div>
         <label>
             <div class="row"><span class="muted">Grid</span><span id="grid-label"></span></div>
-            <input id="grid" type="range" min="4" max="48" step="1" value="16" />
+            <input id="grid" type="range" min="4" max="32" step="1" value="12" />
         </label>
         <button id="block">Block main thread for 3 s</button>
-        <div class="muted">Drag to orbit · scroll to zoom · <code>?renderer=webgl</code> to compare</div>
+        <div class="muted">Drag to orbit · right-drag to pan · scroll to zoom · click the sphere · <code>?renderer=webgl</code> to compare</div>
     </div>
     <script type="module" src="/src/main.ts"></script>
 </body>

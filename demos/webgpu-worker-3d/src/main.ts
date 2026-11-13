@@ -1,4 +1,4 @@
-import type { FromWorker, ToWorker } from './protocol';
+import type { ForwardedEvent, FromWorker, ToWorker } from './protocol';
 
 const canvas = document.getElementById('view') as HTMLCanvasElement;
 const status = document.getElementById('status')!;
@@ -40,6 +40,10 @@ worker.onmessage = (e: MessageEvent<FromWorker>) =>
     {
         workerFps.textContent = `${msg.fps.toFixed(0)} fps`;
     }
+    else if (msg.type === 'cursor')
+    {
+        canvas.style.cursor = msg.cursor;
+    }
     else
     {
         fail(`Worker error: ${msg.message}`);
@@ -55,22 +59,64 @@ send({ type: 'init', canvas: offscreen, preference, grid: Number(gridInput.value
 
 new ResizeObserver(() => send({ type: 'resize', ...size() })).observe(canvas);
 
-// Workers get no DOM events, so forward the ones the camera needs.
-const pointer = (kind: 'down' | 'move' | 'up') => (e: PointerEvent) =>
+// Workers get no DOM events: copy the fields pixi's EventSystem reads and replay them in the worker
+// (see workerEvents.ts). Coordinates are made relative to the canvas.
+function forward(e: PointerEvent | WheelEvent | MouseEvent)
 {
-    if (kind === 'down') canvas.setPointerCapture(e.pointerId);
-    send({ type: 'pointer', kind, x: e.offsetX, y: e.offsetY, id: e.pointerId });
-};
+    const rect = canvas.getBoundingClientRect();
+    const init: Record<string, number | string | boolean> = {
+        clientX: e.clientX - rect.left,
+        clientY: e.clientY - rect.top,
+        button: e.button,
+        buttons: e.buttons,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        movementX: e.movementX,
+        movementY: e.movementY,
+    };
 
-canvas.addEventListener('pointerdown', pointer('down'));
-canvas.addEventListener('pointermove', pointer('move'));
-canvas.addEventListener('pointerup', pointer('up'));
-canvas.addEventListener('pointercancel', pointer('up'));
+    if (e instanceof PointerEvent)
+    {
+        Object.assign(init, {
+            pointerId: e.pointerId,
+            pointerType: e.pointerType,
+            isPrimary: e.isPrimary,
+            width: e.width,
+            height: e.height,
+            pressure: e.pressure,
+        });
+    }
+    if (e instanceof WheelEvent)
+    {
+        Object.assign(init, { deltaX: e.deltaX, deltaY: e.deltaY, deltaZ: e.deltaZ, deltaMode: e.deltaMode });
+    }
+
+    send({ type: 'event', event: { type: e.type as ForwardedEvent['type'], init, onCanvas: e.target === canvas } });
+}
+
+canvas.addEventListener('pointerdown', (e) =>
+{
+    canvas.setPointerCapture(e.pointerId);
+    forward(e);
+});
+canvas.addEventListener('pointerover', forward);
+canvas.addEventListener('pointerleave', forward);
+// pixi tracks moves and releases on the whole document, so drags keep working off the canvas
+window.addEventListener('pointermove', forward);
+window.addEventListener('pointerup', forward);
+window.addEventListener('pointercancel', forward);
 canvas.addEventListener('wheel', (e) =>
 {
-    e.preventDefault();
-    send({ type: 'wheel', deltaY: e.deltaY });
+    e.preventDefault(); // keep the page from scrolling or pinch-zooming
+    forward(e);
 }, { passive: false });
+canvas.addEventListener('contextmenu', (e) =>
+{
+    e.preventDefault(); // right-drag pans the OrbitCamera
+    forward(e);
+});
 
 const updateGridLabel = () =>
 {

@@ -10,8 +10,14 @@ const repoRoot = resolve(__dirname, '../..');
 export default defineConfig({
     resolve: {
         alias: [
+            // `pixi.js/events` etc. are the side-effect entry points (`lib/<name>/init.mjs`)
+            { find: /^pixi\.js\/(.+)$/, replacement: `${resolve(repoRoot, 'lib')}/$1/init.mjs` },
             { find: /^pixi\.js$/, replacement: resolve(repoRoot, 'lib/index.mjs') },
         ],
+    },
+    // Pre-bundling would give @pixi/3d its own copy of pixi.js; it must share the one aliased above.
+    optimizeDeps: {
+        exclude: ['@pixi/3d'],
     },
     worker: {
         format: 'es',

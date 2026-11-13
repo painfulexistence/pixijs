@@ -8,7 +8,10 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "paths": { "pixi.js": ["../../lib/index.d.ts"] }
+    "paths": {
+      "pixi.js": ["../../lib/index.d.ts"],
+      "pixi.js/events": ["../../lib/events/init.d.ts"]
+    }
   },
   "include": ["src"]
 }
